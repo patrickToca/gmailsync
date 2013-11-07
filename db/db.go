@@ -4,23 +4,27 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha1"
+	"encoding/asn1"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"sync"
-
-	"github.com/calmh/gmailsync/asn1"
+	"time"
 )
 
 var _ = log.Printf
+var _ = fmt.Printf
 
 const (
-	AnyType uint8 = iota
+	AnyType = iota
 	MessageRecordType
 	LabelsRecordType
+	DeleteRecordType
+	HaveRecordType
 )
 
 type DB struct {
@@ -31,32 +35,43 @@ type DB struct {
 	fd            *os.File
 }
 
+const (
+	FeatureCompressed = 1 << iota
+	FeatureHashed
+)
+
 type Header struct {
-	Type   uint8
-	Length uint32
+	Type        uint16
+	FeatureBits uint16
+	Length      uint32
 }
 
 type MessageRecord struct {
-	MsgID int64
-	Data  []byte
+	MessageID int64
+	Data      []byte
 }
 
 type LabelsRecord []LabelsEntry
 
 type LabelsEntry struct {
-	MsgID  int64
-	Labels []string
+	MessageID int64
+	Labels    [][]byte
 }
 
-var magic = []byte("gmls")
+const fileMagic = 0x20121025
 
-func (db *DB) readHeader() (*Header, error) {
-	var hdr Header
-	err := binary.Read(db.fd, binary.LittleEndian, &hdr)
-	if err != nil {
-		return nil, err
-	}
-	return &hdr, nil
+var fileHeaderLength = binary.Size(FileHeader{})
+
+type FileHeader struct {
+	Magic      uint32
+	Version    uint8
+	Reserved0  uint8
+	Reserved1  uint16
+	CreateTime uint32
+	UpdateTime uint32
+	HavePtr    uint64
+	Reserved2  uint64
+	Reserved3  uint64
 }
 
 func Open(name string) (*DB, error) {
@@ -74,13 +89,18 @@ func Open(name string) (*DB, error) {
 
 	db.fd = f
 
+	var fhdr FileHeader
 	if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
 		// New file, write magic
-		f.Write(magic)
+		fhdr = FileHeader{
+			Magic:      fileMagic,
+			Version:    1,
+			CreateTime: uint32(time.Now().Unix()),
+		}
+		binary.Write(db.fd, binary.LittleEndian, fhdr)
 	} else {
-		var magicBuf = make([]byte, len(magic))
-		f.Read(magicBuf)
-		if bytes.Compare(magicBuf, magic) != 0 {
+		binary.Read(db.fd, binary.LittleEndian, &fhdr)
+		if fhdr.Magic != fileMagic {
 			return nil, errors.New("Incorrect file format")
 		}
 	}
@@ -96,10 +116,10 @@ func Open(name string) (*DB, error) {
 
 		switch trec := rec.(type) {
 		case MessageRecord:
-			db.haveMsgID[trec.MsgID] = true
+			db.haveMsgID[trec.MessageID] = true
 		case LabelsRecord:
 			for _, lrec := range trec {
-				db.labels[lrec.MsgID] = lrec.Labels
+				db.labels[lrec.MessageID] = bytesSliceToStrings(lrec.Labels)
 			}
 		}
 	}
@@ -108,8 +128,24 @@ func Open(name string) (*DB, error) {
 	return &db, nil
 }
 
+func stringSliceToBytes(ss []string) [][]byte {
+	var res [][]byte
+	for _, s := range ss {
+		res = append(res, []byte(s))
+	}
+	return res
+}
+
+func bytesSliceToStrings(bs [][]byte) []string {
+	var res []string
+	for _, b := range bs {
+		res = append(res, string(b))
+	}
+	return res
+}
+
 func (db *DB) Rewind() {
-	db.fd.Seek(int64(len(magic)), os.SEEK_SET)
+	db.fd.Seek(int64(fileHeaderLength), os.SEEK_SET)
 }
 
 func (db *DB) Size() int {
@@ -138,7 +174,7 @@ func (db *DB) SetLabels(msgid int64, labels []string) {
 }
 
 func (db *DB) WriteMessage(msgid int64, data []byte) error {
-	rec := MessageRecord{MsgID: msgid, Data: data}
+	rec := MessageRecord{MessageID: msgid, Data: data}
 	bs, err := asn1.Marshal(rec)
 	if err != nil {
 		panic(err)
@@ -147,7 +183,7 @@ func (db *DB) WriteMessage(msgid int64, data []byte) error {
 	defer db.Unlock()
 	db.Lock()
 
-	return db.writeRecord(MessageRecordType, bs)
+	return db.writeRecord(MessageRecordType, FeatureCompressed|FeatureHashed, bs)
 }
 
 func (db *DB) ReadMessage() (*MessageRecord, error) {
@@ -166,7 +202,7 @@ func (db *DB) WriteLabels() error {
 	db.Lock()
 
 	for msgid := range db.labelsChanged {
-		rec := LabelsEntry{MsgID: msgid, Labels: db.labels[msgid]}
+		rec := LabelsEntry{MessageID: msgid, Labels: stringSliceToBytes(db.labels[msgid])}
 		lbls = append(lbls, rec)
 	}
 	db.labelsChanged = make(map[int64]bool)
@@ -176,12 +212,13 @@ func (db *DB) WriteLabels() error {
 		panic(err)
 	}
 
-	return db.writeRecord(LabelsRecordType, bs)
+	return db.writeRecord(LabelsRecordType, FeatureCompressed, bs)
 }
 
-func (db *DB) nextRecord(recordType uint8) (interface{}, error) {
+func (db *DB) nextRecord(recordType uint16) (interface{}, error) {
 	for {
-		hdr, err := db.readHeader()
+		var hdr Header
+		err := binary.Read(db.fd, binary.LittleEndian, &hdr)
 		if err != nil {
 			return nil, err
 		}
@@ -191,18 +228,33 @@ func (db *DB) nextRecord(recordType uint8) (interface{}, error) {
 			continue
 		}
 
-		var buf = make([]byte, hdr.Length)
-		_, err = db.fd.Read(buf)
+		var data = make([]byte, hdr.Length)
+		_, err = db.fd.Read(data)
 		if err != nil {
 			return nil, err
 		}
 
-		buf = checkDecompress(buf)
+		var dhash []byte
+		if hdr.FeatureBits&FeatureHashed != 0 {
+			dhash = data[:20]
+			data = data[20:]
+		}
+
+		if hdr.FeatureBits&FeatureCompressed != 0 {
+			data = decompress(data)
+		}
+
+		if hdr.FeatureBits&FeatureHashed != 0 {
+			chash := hash(data)
+			if bytes.Compare(chash, dhash) != 0 {
+				panic("hash failure")
+			}
+		}
 
 		switch hdr.Type {
 		case MessageRecordType:
 			var msg MessageRecord
-			_, err := asn1.Unmarshal(buf, &msg)
+			_, err := asn1.Unmarshal(data, &msg)
 			if err != nil {
 				panic(err)
 			}
@@ -210,7 +262,7 @@ func (db *DB) nextRecord(recordType uint8) (interface{}, error) {
 
 		case LabelsRecordType:
 			var lbl LabelsRecord
-			_, err := asn1.Unmarshal(buf, &lbl)
+			_, err := asn1.Unmarshal(data, &lbl)
 			if err != nil {
 				panic(err)
 			}
@@ -219,33 +271,42 @@ func (db *DB) nextRecord(recordType uint8) (interface{}, error) {
 	}
 }
 
-func (db *DB) writeRecord(rtype uint8, data []byte) error {
-	pkt := compressedHashed(data)
-	hdr := Header{rtype, uint32(len(pkt))}
+func (db *DB) writeRecord(rtype uint16, features uint16, data []byte) error {
+	var bs []byte
+
+	if features&FeatureHashed != 0 {
+		bs = append(bs, hash(data)...)
+	}
+	if features&FeatureCompressed != 0 {
+		bs = append(bs, compress(data)...)
+	} else {
+		bs = append(bs, data...)
+	}
+
+	hdr := Header{rtype, features, uint32(len(bs))}
 
 	db.fd.Seek(0, os.SEEK_END)
 	binary.Write(db.fd, binary.LittleEndian, hdr)
-	db.fd.Write(pkt)
+	db.fd.Write(bs)
 	return db.fd.Sync()
 }
 
-func compressedHashed(bs []byte) []byte {
-	ha := sha1.New()
-	ha.Write(bs)
-	data := ha.Sum(nil)
-
+func compress(bs []byte) []byte {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	gz.Write(bs)
 	gz.Close()
-
-	data = append(data, buf.Bytes()...)
-
-	return data
+	return buf.Bytes()
 }
 
-func checkDecompress(bs []byte) []byte {
-	gz, err := gzip.NewReader(bytes.NewBuffer(bs[20:]))
+func hash(bs []byte) []byte {
+	ha := sha1.New()
+	ha.Write(bs)
+	return ha.Sum(nil)
+}
+
+func decompress(bs []byte) []byte {
+	gz, err := gzip.NewReader(bytes.NewBuffer(bs))
 	if err != nil {
 		panic(err)
 	}
@@ -254,45 +315,5 @@ func checkDecompress(bs []byte) []byte {
 	if err != nil {
 		panic(err)
 	}
-
-	ha := sha1.New()
-	ha.Write(data)
-	hash := ha.Sum(nil)
-
-	if bytes.Compare(hash, bs[:20]) != 0 {
-		log.Fatalf("Hash mismatch %x != %x", hash, bs[:20])
-	}
-
 	return data
 }
-
-/*
-func (db *DB) Validate() (int, error) {
-	var nvalidated int
-
-	for {
-		rec, err := db.Read()
-		if rec == nil && err == nil {
-			break
-		}
-		if err != nil {
-			return nvalidated, err
-		}
-
-		gz, _ := gzip.NewReader(bytes.NewBuffer(rec.Data))
-		uncompressed, _ := ioutil.ReadAll(gz)
-		gz.Close()
-
-		ha := sha1.New()
-		ha.Write(uncompressed)
-		hash := ha.Sum(nil)
-
-		if bytes.Compare(hash, rec.Hash) != 0 {
-			return nvalidated, errors.New("Hash mismatch")
-		}
-
-		nvalidated++
-	}
-	return nvalidated, nil
-}
-*/
