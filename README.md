@@ -1,3 +1,28 @@
+gmailsync
+=========
+
+Maintain an offline copy of a GMail account.
+
+Why?
+====
+
+ - It's easy to deploy. Download a single binary, add your account
+   details to a config file and start syncing. Compatible with Mac OS X,
+   Linux and Windows.
+
+ - It's efficient. All mails are stored compressed in a single archive
+   file, typically requiring about half the space of what GMail reports
+   as your usage..
+
+ - It's safe. All messages are cryptographically hashed to ensure their
+   integrity and the archive format is simple, open and documented.
+   Messages, once written, are never altered or removed.
+
+ - It's portable. The archive can be exported to a standard format MBOX
+   file, readable by most email programs and easily convertable to other
+   storage formats.
+
+
 Archive File Format
 ===================
 
